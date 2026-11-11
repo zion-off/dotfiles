@@ -1,4 +1,18 @@
+# Ghostty config, linked to ~/.config/ghostty/config by install.sh.
+# On macOS Ghostty also reads ~/Library/Application Support/com.mitchellh.ghostty/config
+# (loaded second, wins on conflicts). Once that file is removed, this is the single source.
+
+keybind = shift+enter=text:\x1b\r
+theme = Cursor Dark
+font-family = Geist Mono Regular Regular
+unfocused-split-opacity = 0.8
+window-save-state = never
+fullscreen = true
+# enable alt key
+macos-option-as-alt = true
+macos-icon = holographic
+clipboard-read = allow
+clipboard-write = allow
 # Paste-related settings to debug clipping issue
 clipboard-paste-protection = false
 clipboard-paste-bracketed-safe = false
-keybind = shift+enter=text:\x1b\r
