@@ -5,7 +5,3 @@
   defaultBranch = main
 [commit]
   gpgsign = false
-
-# Machine-specific settings (see gitconfig.mac / gitconfig.vm), linked by install.sh
-[include]
-  path = ~/.gitconfig.local

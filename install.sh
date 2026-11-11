@@ -28,12 +28,9 @@ link bin/tmux-stats "$HOME/.local/bin/tmux-stats"
 
 case "$(uname -s)" in
   Darwin)
-    link gitconfig.mac        "$HOME/.gitconfig.local"
     link ghostty/config       "$HOME/.config/ghostty/config"
-    link lazygit/config.mac.yml "$HOME/Library/Application Support/lazygit/config.yml"
     ;;
   Linux)
-    link gitconfig.vm         "$HOME/.gitconfig.local"
     link lazygit/config.vm.yml "$HOME/.config/lazygit/config.yml"
     ;;
   *) echo "Unknown OS $(uname -s): only shared files linked" ;;
