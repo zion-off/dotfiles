@@ -1,0 +1,4 @@
+# Paste-related settings to debug clipping issue
+clipboard-paste-protection = false
+clipboard-paste-bracketed-safe = false
+keybind = shift+enter=text:\x1b\r

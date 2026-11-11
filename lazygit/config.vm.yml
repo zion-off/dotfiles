@@ -1,0 +1,2 @@
+os:
+  copyToClipboardCmd: 'printf "\033]52;c;$(base64 | tr -d "\n")\007" > /dev/tty'

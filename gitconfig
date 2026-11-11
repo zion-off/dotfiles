@@ -1,0 +1,11 @@
+[user]
+  email = 89874389+zion-off@users.noreply.github.com
+  name = zion
+[init]
+  defaultBranch = main
+[commit]
+  gpgsign = false
+
+# Machine-specific settings (see gitconfig.mac / gitconfig.vm), linked by install.sh
+[include]
+  path = ~/.gitconfig.local
