@@ -1,0 +1,28 @@
+# Shared zsh config, sourced from ~/.zshrc on every machine.
+# Keep this portable: anything macOS- or Linux-specific belongs in that machine's ~/.zshrc.
+
+# Completion (cached - full rebuild at most once a day)
+autoload -Uz compinit
+if [[ -n ~/.zcompdump(#qN.mh+24) ]]; then
+  compinit
+else
+  compinit -C
+fi
+
+# History
+HISTFILE=~/.zsh_history
+HISTSIZE=10000
+SAVEHIST=20000
+setopt SHARE_HISTORY
+setopt HIST_IGNORE_ALL_DUPS
+setopt HIST_FIND_NO_DUPS
+setopt HIST_IGNORE_SPACE
+
+# Editor
+export EDITOR=nvim
+export GIT_EDITOR=nvim
+
+# Aliases
+alias lg='lazygit'
+alias tma='tmux attach -t'
+alias oc='opal-cli tui'
