@@ -24,6 +24,7 @@ link() { # link <repo-relative source> <absolute target>
 link tmux.conf  "$HOME/.tmux.conf"
 link p10k.zsh   "$HOME/.p10k.zsh"
 link gitconfig  "$HOME/.gitconfig"
+link bin/tmux-stats "$HOME/.local/bin/tmux-stats"
 
 case "$(uname -s)" in
   Darwin)

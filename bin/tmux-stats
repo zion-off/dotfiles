@@ -1,0 +1,22 @@
+#!/bin/sh
+# Prints "CPU 12% MEM 8.1/16G" for the tmux status bar. Works on macOS and Linux.
+case "$(uname -s)" in
+  Darwin)
+    ncpu=$(sysctl -n hw.ncpu)
+    cpu=$(ps -A -o %cpu | awk -v n="$ncpu" 'NR>1 {s+=$1} END {printf "%.0f", s/n}')
+    mem=$(vm_stat | awk -v p="$(sysctl -n hw.pagesize)" -v t="$(sysctl -n hw.memsize)" '
+      /Pages active/ {a=$3} /Pages wired down/ {w=$4} /occupied by compressor/ {c=$5}
+      END {printf "%.1f/%.0fG", (a+w+c)*p/1073741824, t/1073741824}')
+    ;;
+  Linux)
+    read -r _ u1 n1 s1 i1 w1 q1 sq1 _ < /proc/stat
+    sleep 0.2
+    read -r _ u2 n2 s2 i2 w2 q2 sq2 _ < /proc/stat
+    idle=$(( (i2 + w2) - (i1 + w1) ))
+    total=$(( (u2+n2+s2+i2+w2+q2+sq2) - (u1+n1+s1+i1+w1+q1+sq1) ))
+    cpu=$(( total > 0 ? 100 * (total - idle) / total : 0 ))
+    mem=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf "%.1f/%.0fG", (t-a)/1048576, t/1048576}' /proc/meminfo)
+    ;;
+  *) exit 0 ;;
+esac
+printf 'CPU %s%% MEM %s' "$cpu" "$mem"
