@@ -1,5 +1,5 @@
 #!/bin/sh
-# Prints "CPU 12% MEM 8.1/16G" for the tmux status bar. Works on macOS and Linux.
+# Prints "CPU 12% LOAD 1.5/16 MEM 8.1/16G" (LOAD on Linux only) for the tmux status bar. Works on macOS and Linux.
 case "$(uname -s)" in
   Darwin)
     ncpu=$(sysctl -n hw.ncpu)
@@ -9,14 +9,29 @@ case "$(uname -s)" in
       END {printf "%.1f/%.0fG", (a+w+c)*p/1073741824, t/1073741824}')
     ;;
   Linux)
-    read -r _ u1 n1 s1 i1 w1 q1 sq1 _ < /proc/stat
-    sleep 0.2
-    read -r _ u2 n2 s2 i2 w2 q2 sq2 _ < /proc/stat
+    # CPU is averaged over the time since the previous run (tmux runs this every
+    # status-interval), so bursts between runs are counted. A 0.2s sample is the
+    # fallback when there is no recent previous run.
+    state="${XDG_RUNTIME_DIR:-/tmp}/tmux-stats-cpu-$(id -u)"
+    now=$(date +%s)
+    read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ < /proc/stat
+    age=-1
+    if [ -r "$state" ] && read -r ts u1 n1 s1 i1 w1 q1 sq1 st1 < "$state"; then
+      age=$(( now - ts ))
+    fi
+    if [ "$age" -lt 1 ] || [ "$age" -gt 15 ]; then
+      u1=$u2 n1=$n2 s1=$s2 i1=$i2 w1=$w2 q1=$q2 sq1=$sq2 st1=$st2
+      sleep 0.2
+      read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ < /proc/stat
+    fi
+    echo "$now $u2 $n2 $s2 $i2 $w2 $q2 $sq2 $st2" > "$state" 2>/dev/null
     idle=$(( (i2 + w2) - (i1 + w1) ))
-    total=$(( (u2+n2+s2+i2+w2+q2+sq2) - (u1+n1+s1+i1+w1+q1+sq1) ))
+    total=$(( (u2+n2+s2+i2+w2+q2+sq2+st2) - (u1+n1+s1+i1+w1+q1+sq1+st1) ))
     cpu=$(( total > 0 ? 100 * (total - idle) / total : 0 ))
+    read -r load _ < /proc/loadavg
+    load_info=" LOAD $load/$(nproc)"
     mem=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf "%.1f/%.0fG", (t-a)/1048576, t/1048576}' /proc/meminfo)
     ;;
   *) exit 0 ;;
 esac
-printf 'CPU %s%% MEM %s' "$cpu" "$mem"
+printf 'CPU %s%%%s MEM %s' "$cpu" "$load_info" "$mem"
