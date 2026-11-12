@@ -1,5 +1,5 @@
 #!/bin/sh
-# Prints "CPU 12% LOAD 1.5/16 MEM 8.1/16G" (LOAD on Linux only) for the tmux status bar. Works on macOS and Linux.
+# Prints "CPU 12% MEM 8.1/16G" for the tmux status bar. Works on macOS and Linux.
 case "$(uname -s)" in
   Darwin)
     ncpu=$(sysctl -n hw.ncpu)
@@ -28,10 +28,8 @@ case "$(uname -s)" in
     idle=$(( (i2 + w2) - (i1 + w1) ))
     total=$(( (u2+n2+s2+i2+w2+q2+sq2+st2) - (u1+n1+s1+i1+w1+q1+sq1+st1) ))
     cpu=$(( total > 0 ? 100 * (total - idle) / total : 0 ))
-    read -r load _ < /proc/loadavg
-    load_info=" LOAD $load/$(nproc)"
     mem=$(awk '/MemTotal/ {t=$2} /MemAvailable/ {a=$2} END {printf "%.1f/%.0fG", (t-a)/1048576, t/1048576}' /proc/meminfo)
     ;;
   *) exit 0 ;;
 esac
-printf 'CPU %s%%%s MEM %s' "$cpu" "$load_info" "$mem"
+printf 'CPU %s%% MEM %s' "$cpu" "$mem"
