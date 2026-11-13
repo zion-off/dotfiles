@@ -170,7 +170,7 @@ pkgname() { # <tool> -> package for $PM; empty = not (usefully) packaged, use do
 
 fallback_ok() { # can we download a release binary into ~/.local for this tool on this machine?
   [ "$OS" = Linux ] && [ -n "${A_GH:-}" ] || return 1
-  case $1 in nvim | gh | lazygit | tree-sitter) return 0 ;; *) return 1 ;; esac
+  case $1 in nvim | gh | lazygit | tree-sitter | fzf) return 0 ;; *) return 1 ;; esac
 }
 
 fix_hint() {
@@ -227,6 +227,10 @@ fallback_install() { # <tool>: install a prebuilt release into ~/.local (no root
         rm -rf "$HOME/.local/opt/nvim" && mkdir -p "$HOME/.local/opt/nvim" &&
         tar -xzf "$TMP/a.tgz" -C "$HOME/.local/opt/nvim" --strip-components=1 &&
         ln -sf ../opt/nvim/bin/nvim "$bin/nvim" ;;
+    fzf)
+      tag=$(latest_tag junegunn/fzf) || return 1; v=${tag#v}
+      dl "$GH_URL/junegunn/fzf/releases/download/$tag/fzf-${v}-linux_${A_GH}.tar.gz" "$TMP/a.tgz" &&
+        tar -xzf "$TMP/a.tgz" -C "$TMP" fzf && install -m 755 "$TMP/fzf" "$bin/fzf" ;;
     tree-sitter)
       tag=$(latest_tag tree-sitter/tree-sitter) || return 1
       dl "$GH_URL/tree-sitter/tree-sitter/releases/download/$tag/tree-sitter-linux-${A_TS}.gz" "$TMP/ts.gz" &&
