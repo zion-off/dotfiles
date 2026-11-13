@@ -1,6 +1,9 @@
 # Shared zsh config, sourced from ~/.zshrc on every machine.
 # Keep this portable: anything macOS- or Linux-specific belongs in that machine's ~/.zshrc.
 
+# User-local binaries (dot, tmux-stats, and tools dot downloads without root)
+export PATH="$HOME/.local/bin:$PATH"
+
 # Completion (cached - full rebuild at most once a day)
 autoload -Uz compinit
 if [[ -n ~/.zcompdump(#qN.mh+24) ]]; then

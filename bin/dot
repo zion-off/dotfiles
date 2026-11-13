@@ -1,0 +1,583 @@
+#!/bin/sh
+# dot - set up a new machine with your dotfiles, tools and editor in one command.
+#
+#   dot install [-y] [-n]   bootstrap everything: package manager, tools, links, shell, git, LazyVim
+#   dot doctor              check everything; change nothing
+#   dot link [-n]           (re)create symlinks only
+#   dot uninstall           remove our symlinks and restore *.pre-dotfiles backups
+#
+#   -y  assume yes to prompts     -n  dry run (show what would happen)
+#
+# install is idempotent. Each step that fails is reported with the exact fix, and in an
+# interactive terminal you are offered a retry once you have applied it.
+# ~/.zshrc is not managed; install appends one `source .../zshrc.common` line to it.
+
+set -u
+
+self=$0
+while [ -L "$self" ]; do
+  t=$(readlink "$self")
+  case $t in /*) self=$t ;; *) self=$(dirname "$self")/$t ;; esac
+done
+DOT=$(cd "$(dirname "$self")/.." && pwd)
+
+DRY=0 YES=0 PM="" SUDO="" NETOK="" OS=$(uname -s) ARCH=$(uname -m)
+FAILS=0 WARNS=0
+NVIM_REPO=https://github.com/zion-off/nvim.git
+GH_URL=https://github.com
+BREW_INSTALLER=https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh
+
+ORIG_PATH=$PATH
+PATH="$HOME/.local/bin:$PATH"
+
+TMP=$(mktemp -d) && trap 'rm -rf "$TMP"' EXIT
+
+if [ -t 1 ]; then R=$(printf '\033[31m') G=$(printf '\033[32m') Y=$(printf '\033[33m') B=$(printf '\033[1m') Z=$(printf '\033[0m')
+else R="" G="" Y="" B="" Z=""; fi
+
+ok()    { printf '  %sok%s    %s\n' "$G" "$Z" "$*"; }
+warn()  { printf '  %swarn%s  %s\n' "$Y" "$Z" "$1"; [ -n "${2:-}" ] && printf '        -> %s\n' "$2"; WARNS=$((WARNS + 1)); }
+bad()   { printf '  %sFAIL%s  %s\n' "$R" "$Z" "$1"; [ -n "${2:-}" ] && printf '        -> %s\n' "$2"; FAILS=$((FAILS + 1)); }
+info()  { printf '  %s\n' "$*"; }
+title() { printf '\n%s%s%s\n' "$B" "$*" "$Z"; }
+
+run() {
+  if [ "$DRY" = 1 ]; then info "would run: $*"; return 0; fi
+  "$@"
+}
+
+interactive() { [ -t 0 ] && [ -r /dev/tty ]; }
+
+confirm() {
+  [ "$DRY" = 1 ] && return 0
+  [ "$YES" = 1 ] && return 0
+  if ! interactive; then info "non-interactive shell: re-run with -y to allow: $1"; return 1; fi
+  printf '  %s [Y/n] ' "$1"
+  read -r ans </dev/tty || return 1
+  case $ans in n | N | no | NO) return 1 ;; *) return 0 ;; esac
+}
+
+ver_ge() { # ver_ge <have> <want>
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    split(a, x, "."); split(b, y, ".")
+    for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+    exit 0 }'
+}
+
+# ---------- environment ----------
+
+detect_env() {
+  PM="" SUDO=""
+  if ! command -v brew >/dev/null 2>&1; then
+    for b in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+      [ -x "$b" ] && eval "$("$b" shellenv)" && break
+    done
+  fi
+  if command -v brew >/dev/null 2>&1; then PM=brew
+  elif command -v apt-get >/dev/null 2>&1; then PM=apt
+  elif command -v dnf >/dev/null 2>&1; then PM=dnf
+  elif command -v pacman >/dev/null 2>&1; then PM=pacman
+  fi
+  if [ -n "$PM" ] && [ "$PM" != brew ] && [ "$(id -u)" != 0 ]; then
+    command -v sudo >/dev/null 2>&1 && SUDO=sudo
+  fi
+  case $ARCH in
+    x86_64 | amd64) A_GH=amd64 A_LG=x86_64 A_NV=x86_64 A_TS=x64 ;;
+    aarch64 | arm64) A_GH=arm64 A_LG=arm64 A_NV=arm64 A_TS=arm64 ;;
+    *) A_GH="" ;;
+  esac
+}
+
+have_clt() { [ "$OS" != Darwin ] || xcode-select -p >/dev/null 2>&1; }
+
+# Reachability of github.com, checked once, only when something needs to download.
+need_net() {
+  [ "$NETOK" = 1 ] && return 0
+  [ "$NETOK" = 0 ] && return 1
+  command -v curl >/dev/null 2>&1 || { NETOK=0; bad "curl is missing, cannot download" "install curl with your package manager, then re-run: dot install"; return 1; }
+  if curl -fsS --max-time 15 -o /dev/null "$GH_URL" 2>/dev/null; then NETOK=1; return 0; fi
+  NETOK=0
+  bad "cannot reach github.com" "check your connection/VPN (behind a proxy? export https_proxy=...), then re-run: dot install"
+  return 1
+}
+
+# ---------- tools ----------
+
+# Required by these dotfiles and by LazyVim (nvim, git, curl, C compiler, tree-sitter-cli, ripgrep, fd, fzf, lazygit).
+TOOLS="git curl cc zsh tmux nvim fzf lazygit gh rg fd tree-sitter"
+
+tool_why() {
+  case $1 in
+    nvim) echo "LazyVim needs >= 0.11.2 built with LuaJIT" ;;
+    git) echo "LazyVim needs >= 2.19.0" ;;
+    fzf) echo "zshrc uses 'fzf --zsh' (>= 0.48.0)" ;;
+    cc | tree-sitter) echo "needed by nvim-treesitter" ;;
+    curl) echo "needed by blink.cmp and downloads" ;;
+    rg | fd) echo "needed by LazyVim pickers" ;;
+    *) echo "" ;;
+  esac
+}
+
+have_cmd() {
+  case $1 in
+    cc) for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && have_clt && return 0; done; return 1 ;;
+    git) command -v git >/dev/null 2>&1 && have_clt ;;
+    fd) command -v fd >/dev/null 2>&1 || command -v fdfind >/dev/null 2>&1 ;;
+    *) command -v "$1" >/dev/null 2>&1 ;;
+  esac
+}
+
+tool_ver() {
+  case $1 in
+    nvim) nvim --version 2>/dev/null | sed -n '1s/^NVIM v\([0-9.]*\).*/\1/p' ;;
+    git) git --version 2>/dev/null | sed -n 's/^git version \([0-9][0-9.]*\).*/\1/p' ;;
+    fzf) fzf --version 2>/dev/null | awk '{print $1; exit}' ;;
+  esac
+}
+
+tool_min() {
+  case $1 in nvim) echo 0.11.2 ;; git) echo 2.19.0 ;; fzf) echo 0.48.0 ;; esac
+}
+
+tool_state() { # ok | missing | old | nojit
+  have_cmd "$1" || { echo missing; return; }
+  m=$(tool_min "$1")
+  if [ -n "$m" ]; then
+    v=$(tool_ver "$1")
+    if [ -z "$v" ] || ! ver_ge "$v" "$m"; then echo old; return; fi
+  fi
+  if [ "$1" = nvim ] && ! nvim --version 2>/dev/null | grep -qi luajit; then echo nojit; return; fi
+  echo ok
+}
+
+pkgname() { # <tool> -> package for $PM; empty = not (usefully) packaged, use download fallback
+  case "$1:$PM" in
+    nvim:apt) echo "" ;;
+    nvim:*) echo neovim ;;
+    gh:apt | gh:dnf) echo "" ;;
+    gh:pacman) echo github-cli ;;
+    lazygit:apt | lazygit:dnf) echo "" ;;
+    rg:*) echo ripgrep ;;
+    fd:apt | fd:dnf) echo fd-find ;;
+    tree-sitter:brew | tree-sitter:pacman) echo tree-sitter-cli ;;
+    tree-sitter:*) echo "" ;;
+    cc:brew) echo "" ;;
+    cc:apt) echo build-essential ;;
+    cc:dnf | cc:pacman) echo gcc ;;
+    *) echo "$1" ;;
+  esac
+}
+
+fallback_ok() { # can we download a release binary into ~/.local for this tool on this machine?
+  [ "$OS" = Linux ] && [ -n "${A_GH:-}" ] || return 1
+  case $1 in nvim | gh | lazygit | tree-sitter) return 0 ;; *) return 1 ;; esac
+}
+
+fix_hint() {
+  t=$1
+  if [ "$t" = cc ] && [ "$OS" = Darwin ]; then echo "xcode-select --install (finish the installer dialog), then re-run: dot install"; return; fi
+  if fallback_ok "$t"; then echo "dot install (downloads the current release into ~/.local/bin)"; return; fi
+  p=$(pkgname "$t")
+  case $PM in
+    brew) [ -n "$p" ] && { echo "brew install $p"; return; } ;;
+    apt) [ -n "$p" ] && { echo "sudo apt-get install $p"; return; } ;;
+    dnf) [ -n "$p" ] && { echo "sudo dnf install $p"; return; } ;;
+    pacman) [ -n "$p" ] && { echo "sudo pacman -S $p"; return; } ;;
+  esac
+  [ -z "$PM" ] && [ "$OS" = Darwin ] && { echo "dot install (installs Homebrew first)"; return; }
+  echo "install '$t' manually (no package or prebuilt binary for $OS/$ARCH), then re-run: dot install"
+}
+
+pm_install() { # <pkg> [upgrade]
+  case $PM in
+    brew) if [ "${2:-}" = upgrade ]; then run brew upgrade "$1"; else run brew install "$1"; fi ;;
+    apt) run $SUDO apt-get install -y "$1" ;;
+    dnf) run $SUDO dnf install -y "$1" ;;
+    pacman) run $SUDO pacman -S --needed --noconfirm "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+dl() { curl -fL --retry 3 --retry-delay 2 -sS -o "$2" "$1"; }
+
+latest_tag() { # <owner/repo>
+  tag=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "$GH_URL/$1/releases/latest" | sed 's#.*/##')
+  case $tag in v[0-9]*) echo "$tag" ;; *) return 1 ;; esac
+}
+
+fallback_install() { # <tool>: install a prebuilt release into ~/.local (no root needed)
+  t=$1
+  fallback_ok "$t" || return 1
+  if [ "$DRY" = 1 ]; then info "would download the latest $t release into ~/.local"; return 0; fi
+  need_net || return 1
+  command -v tar >/dev/null 2>&1 || { bad "tar is missing" "install tar, then re-run: dot install"; return 1; }
+  bin="$HOME/.local/bin"; mkdir -p "$bin" || return 1
+  case $t in
+    lazygit)
+      tag=$(latest_tag jesseduffield/lazygit) || return 1; v=${tag#v}
+      dl "$GH_URL/jesseduffield/lazygit/releases/download/$tag/lazygit_${v}_Linux_${A_LG}.tar.gz" "$TMP/a.tgz" &&
+        tar -xzf "$TMP/a.tgz" -C "$TMP" lazygit && install -m 755 "$TMP/lazygit" "$bin/lazygit" ;;
+    gh)
+      tag=$(latest_tag cli/cli) || return 1; v=${tag#v}
+      dl "$GH_URL/cli/cli/releases/download/$tag/gh_${v}_linux_${A_GH}.tar.gz" "$TMP/a.tgz" &&
+        tar -xzf "$TMP/a.tgz" -C "$TMP" && install -m 755 "$TMP/gh_${v}_linux_${A_GH}/bin/gh" "$bin/gh" ;;
+    nvim)
+      tag=$(latest_tag neovim/neovim) || return 1
+      dl "$GH_URL/neovim/neovim/releases/download/$tag/nvim-linux-${A_NV}.tar.gz" "$TMP/a.tgz" &&
+        rm -rf "$HOME/.local/opt/nvim" && mkdir -p "$HOME/.local/opt/nvim" &&
+        tar -xzf "$TMP/a.tgz" -C "$HOME/.local/opt/nvim" --strip-components=1 &&
+        ln -sf ../opt/nvim/bin/nvim "$bin/nvim" ;;
+    tree-sitter)
+      tag=$(latest_tag tree-sitter/tree-sitter) || return 1
+      dl "$GH_URL/tree-sitter/tree-sitter/releases/download/$tag/tree-sitter-linux-${A_TS}.gz" "$TMP/ts.gz" &&
+        gunzip -c "$TMP/ts.gz" >"$TMP/ts" && install -m 755 "$TMP/ts" "$bin/tree-sitter" ;;
+  esac
+}
+
+# ---------- steps: package manager ----------
+
+step_preflight() {
+  title "System"
+  info "$OS $ARCH, package manager: ${PM:-none}${SUDO:+ (via sudo)}"
+  case $OS in Darwin | Linux) ;; *) bad "unsupported OS: $OS" "only macOS and Linux are supported" ;; esac
+  if [ -n "$PM" ] && [ "$PM" != brew ] && [ -z "$SUDO" ] && [ "$(id -u)" != 0 ]; then
+    warn "no sudo and not root: system packages cannot be installed" "run as root, or rely on the ~/.local downloads (nvim, gh, lazygit, tree-sitter)"
+  fi
+  if [ "$OS" = Darwin ] && ! have_clt; then
+    if [ "$DRY" = 1 ]; then info "Xcode Command Line Tools missing: install would stop here until they are installed"; return 0; fi
+    bad "Xcode Command Line Tools are not installed (git, C compiler, Homebrew need them)" "run: xcode-select --install, wait for the dialog to finish, then re-run: dot install"
+    return 1
+  fi
+}
+
+step_brew() {
+  [ "$OS" = Darwin ] || return 0
+  [ "$PM" = brew ] && return 0
+  title "Homebrew"
+  info "Homebrew is not installed"
+  if ! have_clt; then info "skipped: needs Xcode Command Line Tools first"; return 0; fi
+  confirm "Install Homebrew?" || { info "skipped"; return 0; }
+  if [ "$DRY" = 1 ]; then info "would run the official Homebrew installer"; return 0; fi
+  need_net || return 1
+  if /bin/bash -c "$(curl -fsSL "$BREW_INSTALLER")"; then
+    detect_env
+    if [ "$PM" = brew ]; then
+      line='eval "$('"$(command -v brew)"' shellenv)"'
+      grep -qs 'brew shellenv' "$HOME/.zprofile" "$HOME/.zshrc" || echo "$line" >>"$HOME/.zprofile"
+      ok "Homebrew installed"
+    else
+      bad "Homebrew installer finished but brew is not found" "open a new terminal and re-run: dot install"
+    fi
+  else
+    bad "Homebrew installation failed" "read the error above (sudo password? network?), fix it, then re-run: dot install"
+  fi
+}
+
+# ---------- steps: packages ----------
+
+step_packages() {
+  title "Tools"
+  [ "$OS" = Darwin ] && ! have_clt && [ "$DRY" != 1 ] && { info "skipped: Xcode Command Line Tools missing"; return; }
+  need=""
+  for t in $TOOLS; do [ "$(tool_state "$t")" = ok ] || need="$need $t"; done
+  if [ -z "$need" ]; then info "all required tools present and new enough"; fd_link; return; fi
+  info "need:$need"
+
+  if [ -n "$PM" ]; then
+    todo=""
+    for t in $need; do [ -n "$(pkgname "$t")" ] && todo="$todo $t"; done
+    if [ -n "$todo" ] && confirm "Install/upgrade via $PM:$todo?"; then
+      [ "$PM" = apt ] && [ "$DRY" != 1 ] && { run $SUDO apt-get update || warn "apt-get update failed" "continuing with the cached package index"; }
+      for t in $todo; do
+        up=""; have_cmd "$t" && up=upgrade
+        pm_install "$(pkgname "$t")" $up || warn "$PM could not install $t" "see the error above; fix it and re-run: dot install"
+      done
+    fi
+  fi
+
+  left=""
+  for t in $need; do [ "$DRY" = 1 ] || [ "$(tool_state "$t")" != ok ] && left="$left $t"; done
+  dl_list=""
+  for t in $left; do fallback_ok "$t" && dl_list="$dl_list $t"; done
+  if [ -n "$dl_list" ]; then
+    if [ "$DRY" != 1 ]; then info "still not satisfied via $PM:$dl_list"; fi
+    if confirm "Download latest GitHub release binaries into ~/.local/bin for:$dl_list?"; then
+      for t in $dl_list; do
+        fallback_install "$t" && [ "$DRY" = 1 ] || { [ "$(tool_state "$t")" = ok ] && ok "$t installed from release" || warn "could not install $t from a release" "see errors above; re-run: dot install"; }
+      done
+    fi
+  fi
+  fd_link
+}
+
+fd_link() { # Debian/Ubuntu ship fd as fdfind
+  [ "$DRY" = 1 ] && return 0
+  command -v fd >/dev/null 2>&1 && return 0
+  fp=$(command -v fdfind) || return 0
+  mkdir -p "$HOME/.local/bin" && ln -sf "$fp" "$HOME/.local/bin/fd" && info "linked fd -> $fp"
+}
+
+PLUGINS="powerlevel10k zsh-syntax-highlighting zsh-autosuggestions"
+
+plugin_found() {
+  for p in "${HOMEBREW_PREFIX:-/opt/homebrew}/share/$1" "/usr/local/share/$1" "/usr/share/$1" \
+           "/usr/share/zsh/plugins/$1" "/usr/share/zsh-theme-$1" "$HOME/.local/share/$1"; do
+    [ -d "$p" ] && return 0
+  done
+  return 1
+}
+
+have_cask() { # <name> <app>
+  [ -d "/Applications/$2.app" ] && return 0
+  [ "$PM" = brew ] && brew list --cask "$1" >/dev/null 2>&1
+}
+
+have_font() {
+  ls "$HOME/Library/Fonts" /Library/Fonts 2>/dev/null | grep -qi 'geistmono' && return 0
+  command -v fc-list >/dev/null 2>&1 && fc-list 2>/dev/null | grep -qi 'geist *mono'
+}
+
+step_extras() {
+  title "Shell plugins and apps"
+  if [ "$OS" = Darwin ] && [ "$PM" = brew ]; then
+    have_cask ghostty Ghostty || { confirm "Install Ghostty (cask)?" && { run brew install --cask ghostty || warn "failed to install ghostty" "brew install --cask ghostty"; }; }
+    have_font || { confirm "Install Geist Mono font (cask)?" && { run brew install --cask font-geist-mono || warn "failed to install font" "brew install --cask font-geist-mono"; }; }
+  fi
+  missing=""
+  for pl in $PLUGINS; do plugin_found "$pl" || missing="$missing $pl"; done
+  if [ -z "$missing" ]; then info "zsh plugins present"; return; fi
+  confirm "Install zsh plugins:$missing?" || return 0
+  for pl in $missing; do
+    if [ "$PM" = brew ]; then
+      run brew install "$pl" || warn "failed to install $pl" "brew install $pl"
+    elif [ "$pl" = powerlevel10k ]; then
+      have_cmd git || { warn "git needed to install powerlevel10k"; continue; }
+      [ "$DRY" = 1 ] || need_net || continue
+      { run mkdir -p "$HOME/.local/share" && run git clone --depth=1 "$GH_URL/romkatv/powerlevel10k.git" "$HOME/.local/share/powerlevel10k"; } ||
+        warn "failed to clone powerlevel10k" "re-run: dot install"
+    elif [ -n "$PM" ]; then
+      pm_install "$pl" || warn "failed to install $pl" "install it with your package manager"
+    else
+      warn "no package manager to install $pl"
+    fi
+  done
+}
+
+# ---------- links ----------
+
+each_link() { # each_link <callback>; callback gets <repo-relative src> <abs dst>
+  "$1" tmux.conf "$HOME/.tmux.conf"
+  "$1" p10k.zsh "$HOME/.p10k.zsh"
+  "$1" gitconfig "$HOME/.gitconfig"
+  "$1" bin/tmux-stats "$HOME/.local/bin/tmux-stats"
+  "$1" bin/dot "$HOME/.local/bin/dot"
+  case $OS in
+    Darwin) "$1" ghostty/config "$HOME/.config/ghostty/config" ;;
+    Linux) "$1" lazygit/config.vm.yml "$HOME/.config/lazygit/config.yml" ;;
+  esac
+}
+
+is_ours() { [ -L "$2" ] && [ "$(readlink "$2")" = "$DOT/$1" ]; }
+
+do_link() {
+  src="$DOT/$1" dst=$2
+  [ -e "$src" ] || { bad "missing in repo: $1"; return; }
+  is_ours "$1" "$dst" && { ok "$dst"; return; }
+  if [ "$DRY" = 1 ]; then info "would link $dst -> $src"; return; fi
+  mkdir -p "$(dirname "$dst")" || { bad "cannot create $(dirname "$dst")" "check permissions, then re-run"; return; }
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    mv "$dst" "$dst.pre-dotfiles" || { bad "cannot back up $dst" "move it aside manually, then re-run"; return; }
+    info "backup $dst -> $dst.pre-dotfiles"
+  fi
+  if ln -s "$src" "$dst"; then ok "linked $dst"; else bad "cannot link $dst" "check permissions, then re-run"; fi
+}
+
+check_link() {
+  if is_ours "$1" "$2"; then ok "$2"
+  else bad "not linked: $2" "run: dot link"; fi
+}
+
+undo_link() {
+  if is_ours "$1" "$2"; then
+    rm "$2" && info "removed $2"
+    [ -e "$2.pre-dotfiles" ] && mv "$2.pre-dotfiles" "$2" && info "restored $2"
+  fi
+}
+
+step_links() {
+  title "Links"
+  each_link do_link
+  # A running tmux server only reads its config at startup
+  if [ "$DRY" != 1 ] && command -v tmux >/dev/null 2>&1 && tmux ls >/dev/null 2>&1; then
+    tmux source-file "$HOME/.tmux.conf" 2>/dev/null && info "reloaded running tmux server"
+  fi
+}
+
+# ---------- steps: config ----------
+
+step_git_local() {
+  title "Git credentials (~/.gitconfig.local)"
+  f="$HOME/.gitconfig.local"
+  have_cmd gh || { info "gh not installed; skipped"; return; }
+  if grep -qs 'auth git-credential' "$f"; then ok "gh credential helper already configured"; return; fi
+  if [ "$DRY" = 1 ]; then info "would add gh credential helper to $f"; return; fi
+  {
+    printf '[credential "https://github.com"]\n\thelper =\n\thelper = !gh auth git-credential\n'
+    printf '[credential "https://gist.github.com"]\n\thelper =\n\thelper = !gh auth git-credential\n'
+  } >>"$f" && ok "wrote gh credential helper to $f" || bad "cannot write $f" "check permissions, then re-run"
+}
+
+step_gh_auth() {
+  have_cmd gh || return 0
+  gh auth status >/dev/null 2>&1 && return 0
+  title "GitHub login"
+  if [ "$DRY" = 1 ]; then info "would offer: gh auth login"; return; fi
+  interactive || { info "not logged in; later run: gh auth login"; return; }
+  confirm "Log in to GitHub now (gh auth login)?" && { gh auth login || warn "gh login did not complete" "run: gh auth login"; }
+}
+
+step_zshrc() {
+  title "Shell (~/.zshrc)"
+  if grep -qs "$DOT/zshrc.common" "$HOME/.zshrc"; then ok "~/.zshrc sources zshrc.common"; return; fi
+  if [ "$DRY" = 1 ]; then info "would append: source $DOT/zshrc.common"; return; fi
+  echo "source $DOT/zshrc.common" >>"$HOME/.zshrc" && ok "appended source line to ~/.zshrc" ||
+    bad "cannot write ~/.zshrc" "add manually: source $DOT/zshrc.common"
+}
+
+lazy_dir="$HOME/.local/share/nvim/lazy/LazyVim"
+
+step_nvim() {
+  title "Neovim config (LazyVim)"
+  d="$HOME/.config/nvim"
+  if [ -e "$d" ]; then ok "$d exists"
+  else
+    if ! have_cmd git; then info "git missing; skipped"; return; fi
+    if confirm "Clone $NVIM_REPO to $d?"; then
+      [ "$DRY" = 1 ] || need_net || return
+      run git clone "$NVIM_REPO" "$d" || { bad "git clone of nvim config failed" "check access to $NVIM_REPO (gh auth login?), then re-run: dot install"; return; }
+    else
+      info "skipped"; return
+    fi
+  fi
+  [ "$DRY" = 1 ] && return 0
+  [ "$(tool_state nvim)" = ok ] || { info "nvim not ready; plugin install skipped"; return; }
+  if [ -f "$d/init.lua" ] && [ ! -d "$lazy_dir" ]; then
+    if confirm "Install Neovim plugins now (headless, per lazy-lock.json)?"; then
+      need_net || return
+      nvim --headless "+Lazy! restore" +qa || warn "plugin install reported errors" "open nvim once, or run: nvim --headless '+Lazy! restore' +qa"
+    fi
+  fi
+}
+
+# ---------- doctor ----------
+
+doctor() {
+  title "Doctor: required tools"
+  [ "$OS" = Darwin ] && { have_clt && ok "Xcode Command Line Tools" || bad "Xcode Command Line Tools missing" "xcode-select --install"; }
+  [ "$OS" = Darwin ] && [ -z "$PM" ] && bad "Homebrew missing" "dot install (installs it)"
+  for t in $TOOLS; do
+    why=$(tool_why "$t")
+    case $(tool_state "$t") in
+      ok) v=$(tool_ver "$t"); ok "$t${v:+ $v}" ;;
+      missing) bad "$t not installed${why:+ ($why)}" "$(fix_hint "$t")" ;;
+      old) bad "$t is too old: $(tool_ver "$t") < $(tool_min "$t") ($why)" "$(fix_hint "$t")" ;;
+      nojit) bad "nvim is not built with LuaJIT ($why)" "$(fix_hint nvim)" ;;
+    esac
+  done
+
+  title "Doctor: optional"
+  for pl in $PLUGINS; do
+    if plugin_found "$pl"; then ok "$pl"; else warn "$pl not found" "dot install"; fi
+  done
+  if [ "$OS" = Darwin ]; then
+    have_cask ghostty Ghostty && ok "Ghostty" || warn "Ghostty not installed" "brew install --cask ghostty"
+    have_font && ok "Geist Mono font" || warn "Geist Mono font not found" "brew install --cask font-geist-mono"
+  fi
+
+  title "Doctor: links"
+  each_link check_link
+
+  title "Doctor: config"
+  if grep -qs "$DOT/zshrc.common" "$HOME/.zshrc"; then ok "~/.zshrc sources zshrc.common"
+  else bad "~/.zshrc does not source zshrc.common" "dot install (or add: source $DOT/zshrc.common)"; fi
+  if grep -qs 'gitconfig.local' "$DOT/gitconfig"; then ok "gitconfig includes ~/.gitconfig.local"
+  else warn "gitconfig has no [include] for ~/.gitconfig.local"; fi
+  if have_cmd gh; then
+    if grep -qs 'auth git-credential' "$HOME/.gitconfig.local"; then ok "gh credential helper configured"
+    else warn "gh credential helper not configured" "dot install"; fi
+    gh auth status >/dev/null 2>&1 && ok "gh authenticated" || warn "gh not logged in" "gh auth login"
+  fi
+  case ":$ORIG_PATH:" in
+    *":$HOME/.local/bin:"*) ok "~/.local/bin on PATH" ;;
+    *) if grep -qs '\.local/bin' "$DOT/zshrc.common"; then ok "~/.local/bin added to PATH by zshrc.common (open a new shell)"
+       else warn "~/.local/bin not on PATH" 'add: export PATH="$HOME/.local/bin:$PATH"'; fi ;;
+  esac
+  if [ -f "$HOME/.config/nvim/init.lua" ]; then
+    ok "nvim config present"
+    if [ -d "$lazy_dir" ]; then ok "LazyVim plugins installed"
+    else warn "LazyVim plugins not installed yet" "nvim --headless '+Lazy! restore' +qa  (or just open nvim)"; fi
+  else
+    warn "no nvim config at ~/.config/nvim" "dot install (clones $NVIM_REPO)"
+  fi
+  [ -x "$DOT/bin/tmux-stats" ] && { "$DOT/bin/tmux-stats" >/dev/null 2>&1 && ok "tmux-stats runs" || warn "tmux-stats failed to run"; }
+
+  title "Summary"
+  if [ "$FAILS" -gt 0 ]; then
+    printf '  %s%d problem(s)%s, %d warning(s). Apply the fixes above, then re-run: dot %s\n' "$R" "$FAILS" "$Z" "$WARNS" "${CMD:-doctor}"
+    return 1
+  fi
+  printf '  %sAll good%s (%d warning(s)).\n' "$G" "$Z" "$WARNS"
+}
+
+# ---------- commands ----------
+
+cmd_install() {
+  [ "$DRY" = 1 ] && info "dry run: nothing will be changed"
+  while :; do
+    FAILS=0 WARNS=0 NETOK=""
+    step_preflight && { step_brew; detect_env; step_packages; }
+    step_extras
+    step_links
+    step_git_local
+    step_zshrc
+    step_nvim
+    step_gh_auth
+    [ "$DRY" = 1 ] && return 0
+    detect_env
+    doctor && return 0
+    interactive || return 1
+    printf '\n  Apply the fixes above, then press Enter to retry (q to quit): '
+    read -r ans </dev/tty || return 1
+    case $ans in q | Q) return 1 ;; esac
+  done
+}
+
+cmd_link() { title "Links"; each_link do_link; [ "$FAILS" -eq 0 ]; }
+
+cmd_uninstall() {
+  title "Uninstall"
+  each_link undo_link
+  info "left in place: the source line in ~/.zshrc and ~/.gitconfig.local (remove by hand if wanted)"
+}
+
+usage() { sed -n '2,12p' "$self" | sed 's/^# \{0,1\}//'; }
+
+CMD=${1:-help}
+[ $# -gt 0 ] && shift
+for a in "$@"; do
+  case $a in
+    -y) YES=1 ;;
+    -n) DRY=1 ;;
+    *) echo "unknown option: $a" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+detect_env
+case $CMD in
+  install) cmd_install ;;
+  doctor) doctor ;;
+  link) cmd_link ;;
+  uninstall) cmd_uninstall ;;
+  help | -h | --help) usage ;;
+  *) echo "unknown command: $CMD" >&2; usage >&2; exit 2 ;;
+esac
